@@ -78,6 +78,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from typing import NamedTuple
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -412,6 +413,98 @@ def tag_shortfalls(
         for tag, min_qty in minimums.items()
         if answered.get(tag, 0) < min_qty
     }
+
+
+class EligibleItemScan(NamedTuple):
+    """Result of one single streaming pass over the eligible items.
+
+    Only scalars (and one ``(information, id)`` pair per deficient tag) are
+    retained — the candidate rows themselves are never materialised into a
+    list:
+
+    * ``saw_any``        — at least one eligible item exists in the pool;
+    * ``global_winner``  — ``(information, id)`` with maximum Fisher
+                           information (ties broken on the smallest id) over
+                           every eligible item, or ``None`` when the pool is
+                           empty;
+    * ``available_by_tag`` — eligible-item count per non-empty content tag;
+    * ``tag_winners``    — per deficient tag ``(information, id)`` winner,
+                           i.e. the restricted endgame candidate for that tag.
+    """
+
+    saw_any: bool
+    global_winner: tuple[float, str] | None
+    available_by_tag: Counter[str]
+    tag_winners: dict[str, tuple[float, str]]
+
+
+def _better(
+    candidate: tuple[float, str], best: tuple[float, str] | None
+) -> bool:
+    """True when *candidate* wins the ``(information, id)`` comparison.
+
+    Maximum information first; a strict information tie goes to the smaller
+    item id, so the result is independent of cursor iteration order.
+    """
+    return best is None or (-candidate[0], candidate[1]) < (-best[0], best[1])
+
+
+def scan_eligible_items(
+    conn: sqlite3.Connection,
+    session_id: str,
+    exposure_limit: int,
+    theta: float,
+    shortfalls: dict[str, int],
+) -> EligibleItemScan:
+    """Stream every eligible item once and compute all selection statistics.
+
+    Eligibility is exactly the old pool: enabled (``is_active = 1``),
+    ``exposure_count < exposure_limit`` and not already answered in this
+    session.  The database cursor is consumed in a single pass — no
+    candidate list is built and the rows are never rescanned — while each
+    eligible item contributes, at most once, to:
+
+    * the global best ``(information, id)``;
+    * the per-tag eligible-item counter (used for the
+      "deficient tag cannot reach its quota" check);
+    * that tag's own best ``(information, id)`` when the item's tag is
+      deficient (used for the endgame restriction that keeps only
+      deficient-tag candidates).
+    """
+    rows = conn.execute(
+        """
+        SELECT id, discrimination, difficulty, content_tag
+        FROM items
+        WHERE is_active = 1
+          AND exposure_count < ?
+          AND id NOT IN (
+              SELECT item_id FROM responses WHERE session_id = ?
+          )
+        """,
+        (exposure_limit, session_id),
+    )
+    saw_any = False
+    global_winner: tuple[float, str] | None = None
+    available_by_tag: Counter[str] = Counter()
+    tag_winners: dict[str, tuple[float, str]] = {}
+    for row in rows:
+        saw_any = True
+        tag = row["content_tag"]
+        if tag:
+            available_by_tag[tag] += 1
+        info = irt.information(theta, row["discrimination"], row["difficulty"])
+        contender = (info, row["id"])
+        if _better(contender, global_winner):
+            global_winner = contender
+        if tag in shortfalls:
+            if _better(contender, tag_winners.get(tag)):
+                tag_winners[tag] = contender
+    return EligibleItemScan(
+        saw_any=saw_any,
+        global_winner=global_winner,
+        available_by_tag=available_by_tag,
+        tag_winners=tag_winners,
+    )
 
 
 def serialize_session(
@@ -1480,21 +1573,6 @@ def next_item(
             }
 
         else:
-            # Candidate read under the write lock: exposure counts seen here
-            # cannot change before we update them.  Withdrawn items
-            # (is_active = 0) never take part in new selections.
-            candidates = conn.execute(
-                """
-                SELECT * FROM items
-                WHERE is_active = 1
-                  AND exposure_count < ?
-                  AND id NOT IN (
-                      SELECT item_id FROM responses WHERE session_id = ?
-                  )
-                """,
-                (session["exposure_limit"], session_id),
-            ).fetchall()
-
             minimums = tag_minimums_for(conn, session_id)
             shortfalls = (
                 tag_shortfalls(minimums, answered_by_tag(conn, session_id))
@@ -1503,24 +1581,40 @@ def next_item(
             )
             total_shortfall = sum(shortfalls.values())
             slots_left = session["max_items"] - n_answered
+            # When the remaining answer slots equal the deficit exactly,
+            # every remaining item must come from a deficient tag.
+            restricted = bool(minimums and total_shortfall == slots_left)
 
-            # A shortfall can only ever shrink (a quota-tagged answer covers
-            # at most one deficit; a non-quota answer shrinks only the slots),
-            # so total_shortfall <= slots_left always holds while selection
-            # obeys the restriction below.  When the remaining answer slots
-            # equal the deficit exactly, every remaining item must come from
-            # a deficient tag.
-            if minimums and total_shortfall == slots_left:
-                candidates = [
-                    c for c in candidates if c["content_tag"] in shortfalls
-                ]
+            # One single streaming pass over the eligible items (enabled,
+            # exposure under the limit, not yet answered here).  The cursor
+            # is consumed once: the global winner, the per-tag available
+            # counts and the per-deficient-tag winners are all computed in
+            # that pass, so the candidates are never fetched into a list and
+            # re-filtered/scanned.  The read happens under the write lock,
+            # so the exposure counts seen here cannot change before the
+            # update below.  Withdrawn items (is_active = 0) never take part
+            # in new selections.
+            scan = scan_eligible_items(
+                conn,
+                session_id,
+                session["exposure_limit"],
+                session["theta"],
+                shortfalls,
+            )
+
+            # Whether the (possibly restricted) pool has any candidate.
+            pool_has_item = (
+                any(tag in scan.tag_winners for tag in shortfalls)
+                if restricted
+                else scan.saw_any
+            )
 
             # Case 4: no eligible item left in the (possibly restricted)
             # pool -> finish.  With quotas set this also covers the case in
             # which some deficient tag has no eligible item left while
             # non-quota items are still available: the session cannot be
             # completed either way.
-            if not candidates:
+            if not pool_has_item:
                 if minimums:
                     finish_reason = "tag_minimums_unfulfillable"
                     note = (
@@ -1556,11 +1650,19 @@ def next_item(
                 # Even with slots to spare, if any deficient tag cannot
                 # possibly reach its quota (not enough eligible items left
                 # for that tag), finishing early is the only correct outcome:
-                # no item is served and therefore no exposure is added.
+                # no item is served and therefore no exposure is added.  In
+                # the restricted endgame the per-tag counts are taken over
+                # deficient tags only (non-deficient candidates are excluded),
+                # matching the old endgame filtering.
                 infeasible: dict[str, int] = {}
                 if minimums:
-                    available_by_tag = Counter(
-                        c["content_tag"] for c in candidates
+                    available_by_tag = (
+                        {
+                            tag: scan.available_by_tag.get(tag, 0)
+                            for tag in shortfalls
+                        }
+                        if restricted
+                        else scan.available_by_tag
                     )
                     infeasible = {
                         tag: deficit
@@ -1596,31 +1698,35 @@ def next_item(
                 # Case 5: select the maximum-information item (id tie-break),
                 # count exactly one exposure and mark it pending atomically.
                 else:
-                    theta = session["theta"]
-                    best = min(
-                        candidates,
-                        key=lambda r: (
-                            -irt.information(
-                                theta, r["discrimination"], r["difficulty"]
+                    if restricted:
+                        # Endgame: the pool is the deficient-tag items; pick
+                        # the best (max info, min id) among the per-tag
+                        # winners already computed in the single pass.
+                        info, best_id = min(
+                            (
+                                scan.tag_winners[tag]
+                                for tag in shortfalls
+                                if tag in scan.tag_winners
                             ),
-                            r["id"],
-                        ),
-                    )
-                    info = irt.information(
-                        theta, best["discrimination"], best["difficulty"]
-                    )
+                            key=lambda winner: (-winner[0], winner[1]),
+                        )
+                    else:
+                        # pool_has_item guarantees the global winner exists.
+                        winner = scan.global_winner
+                        assert winner is not None
+                        info, best_id = winner
                     conn.execute(
                         "UPDATE items SET exposure_count = exposure_count + 1 "
                         "WHERE id = ?",
-                        (best["id"],),
+                        (best_id,),
                     )
                     conn.execute(
                         "UPDATE sessions SET current_item_id = ?, updated_at = ? "
                         "WHERE id = ?",
-                        (best["id"], now, session_id),
+                        (best_id, now, session_id),
                     )
                     item_row = conn.execute(
-                        "SELECT * FROM items WHERE id = ?", (best["id"],)
+                        "SELECT * FROM items WHERE id = ?", (best_id,)
                     ).fetchone()
                     outcome = {
                         "status": "active",
