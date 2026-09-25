@@ -414,6 +414,23 @@ def tag_shortfalls(
     }
 
 
+def candidate_is_preferred(
+    row: sqlite3.Row,
+    information: float,
+    current_row: sqlite3.Row | None,
+    current_information: float | None,
+) -> bool:
+    """Highest Fisher information wins; equal information uses the smallest id."""
+    return (
+        current_row is None
+        or information > current_information
+        or (
+            information == current_information
+            and row["id"] < current_row["id"]
+        )
+    )
+
+
 def serialize_session(
     row: sqlite3.Row,
     n_answered: int,
@@ -1480,21 +1497,6 @@ def next_item(
             }
 
         else:
-            # Candidate read under the write lock: exposure counts seen here
-            # cannot change before we update them.  Withdrawn items
-            # (is_active = 0) never take part in new selections.
-            candidates = conn.execute(
-                """
-                SELECT * FROM items
-                WHERE is_active = 1
-                  AND exposure_count < ?
-                  AND id NOT IN (
-                      SELECT item_id FROM responses WHERE session_id = ?
-                  )
-                """,
-                (session["exposure_limit"], session_id),
-            ).fetchall()
-
             minimums = tag_minimums_for(conn, session_id)
             shortfalls = (
                 tag_shortfalls(minimums, answered_by_tag(conn, session_id))
@@ -1510,17 +1512,67 @@ def next_item(
             # obeys the restriction below.  When the remaining answer slots
             # equal the deficit exactly, every remaining item must come from
             # a deficient tag.
-            if minimums and total_shortfall == slots_left:
-                candidates = [
-                    c for c in candidates if c["content_tag"] in shortfalls
-                ]
+            restrict_to_shortfalls = bool(
+                minimums and total_shortfall == slots_left
+            )
+
+            # Stream the SQLite cursor once.  In addition to the globally best
+            # eligible item, keep just one best row and one count per deficient
+            # tag instead of materialising every candidate and rescanning it.
+            candidate_rows = conn.execute(
+                """
+                SELECT * FROM items
+                WHERE is_active = 1
+                  AND exposure_count < ?
+                  AND id NOT IN (
+                      SELECT item_id FROM responses WHERE session_id = ?
+                  )
+                """,
+                (session["exposure_limit"], session_id),
+            )
+            theta = session["theta"]
+            global_best: sqlite3.Row | None = None
+            global_best_info: float | None = None
+            tag_best_rows: dict[str, sqlite3.Row | None] = {
+                tag: None for tag in shortfalls
+            }
+            tag_best_information: dict[str, float | None] = {
+                tag: None for tag in shortfalls
+            }
+            available_by_tag = {tag: 0 for tag in shortfalls}
+
+            for candidate in candidate_rows:
+                tag = candidate["content_tag"]
+                if restrict_to_shortfalls and tag not in shortfalls:
+                    continue
+
+                information = irt.information(
+                    theta, candidate["discrimination"], candidate["difficulty"]
+                )
+                if candidate_is_preferred(
+                    candidate, information, global_best, global_best_info
+                ):
+                    global_best = candidate
+                    global_best_info = information
+
+                if tag in shortfalls:
+                    available_by_tag[tag] += 1
+                    if candidate_is_preferred(
+                        candidate,
+                        information,
+                        tag_best_rows[tag],
+                        tag_best_information[tag],
+                    ):
+                        tag_best_rows[tag] = candidate
+                        tag_best_information[tag] = information
+            candidate_rows.close()
 
             # Case 4: no eligible item left in the (possibly restricted)
             # pool -> finish.  With quotas set this also covers the case in
             # which some deficient tag has no eligible item left while
             # non-quota items are still available: the session cannot be
             # completed either way.
-            if not candidates:
+            if global_best is None:
                 if minimums:
                     finish_reason = "tag_minimums_unfulfillable"
                     note = (
@@ -1557,16 +1609,11 @@ def next_item(
                 # possibly reach its quota (not enough eligible items left
                 # for that tag), finishing early is the only correct outcome:
                 # no item is served and therefore no exposure is added.
-                infeasible: dict[str, int] = {}
-                if minimums:
-                    available_by_tag = Counter(
-                        c["content_tag"] for c in candidates
-                    )
-                    infeasible = {
-                        tag: deficit
-                        for tag, deficit in shortfalls.items()
-                        if available_by_tag.get(tag, 0) < deficit
-                    }
+                infeasible: dict[str, int] = {
+                    tag: deficit
+                    for tag, deficit in shortfalls.items()
+                    if available_by_tag[tag] < deficit
+                }
                 if infeasible:
                     conn.execute(
                         """UPDATE sessions
@@ -1596,19 +1643,17 @@ def next_item(
                 # Case 5: select the maximum-information item (id tie-break),
                 # count exactly one exposure and mark it pending atomically.
                 else:
-                    theta = session["theta"]
-                    best = min(
-                        candidates,
-                        key=lambda r: (
-                            -irt.information(
-                                theta, r["discrimination"], r["difficulty"]
-                            ),
-                            r["id"],
-                        ),
-                    )
-                    info = irt.information(
-                        theta, best["discrimination"], best["difficulty"]
-                    )
+                    if global_best is None or global_best_info is None:
+                        # The empty-pool branch above excludes this case.
+                        raise RuntimeError("no candidate selected")
+
+                    # In restricted mode non-deficit rows were skipped during
+                    # the scan, so global_best is already the winner of the
+                    # restricted pool.  Per-tag winners were also retained in
+                    # the same scan to validate each deficit without a rescan.
+                    best = global_best
+                    info = global_best_info
+
                     conn.execute(
                         "UPDATE items SET exposure_count = exposure_count + 1 "
                         "WHERE id = ?",
